@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import { Router } from 'express';
+import crypto from 'crypto';
 import Form, { FORM_FIELD_TYPES } from '../models/Form.js';
 import FormResponse from '../models/FormResponse.js';
 import { requireAuth } from '../middleware/auth.js';
@@ -36,6 +37,10 @@ function serializeForm(doc, { includeMeta = false } = {}) {
   };
   if (includeMeta) {
     payload.responseCount = obj.responseCount || 0;
+    payload.responseShareEnabled = Boolean(obj.responseShareToken);
+    if (obj.responseShareToken) {
+      payload.responseShareToken = obj.responseShareToken;
+    }
   }
   return payload;
 }
@@ -206,6 +211,22 @@ function validateAnswers(fields, answers) {
   return { answers: cleaned };
 }
 
+function newShareToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+function sharedResponsesPayload(form, responses) {
+  const format = ensureFormat(form);
+  return {
+    form: {
+      title: format.title,
+      format,
+      fields: format.fields,
+    },
+    responses: responses.map(serializeResponse),
+  };
+}
+
 router.get('/public', async (_req, res) => {
   try {
     const navForms = await Form.find({ published: true, showInNavbar: { $ne: false } }).sort({ updatedAt: -1 });
@@ -218,6 +239,24 @@ router.get('/public', async (_req, res) => {
   } catch (err) {
     console.error('Public form error:', err);
     return res.status(500).json({ error: 'Could not load form.' });
+  }
+});
+
+router.get('/share/:token/responses', async (req, res) => {
+  try {
+    const token = String(req.params.token || '').trim();
+    if (!token) {
+      return res.status(400).json({ error: 'Invalid share link.' });
+    }
+    const form = await Form.findOne({ responseShareToken: token });
+    if (!form) {
+      return res.status(404).json({ error: 'This share link is invalid or has been revoked.' });
+    }
+    const responses = await FormResponse.find({ formId: form._id }).sort({ createdAt: 1 });
+    return res.json(sharedResponsesPayload(form, responses));
+  } catch (err) {
+    console.error('Shared form responses error:', err);
+    return res.status(500).json({ error: 'Could not load responses.' });
   }
 });
 
@@ -377,6 +416,45 @@ router.delete('/:id', requireAuth, async (req, res) => {
   }
 });
 
+router.post('/:id/share-link', requireAuth, async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) return invalidId(res);
+    const form = await Form.findById(req.params.id);
+    if (!form) {
+      return res.status(404).json({ error: 'Form not found.' });
+    }
+
+    if (req.body.regenerate || !form.responseShareToken) {
+      form.responseShareToken = newShareToken();
+      await form.save();
+    }
+
+    return res.json({
+      token: form.responseShareToken,
+      path: `/responses/share/${form.responseShareToken}`,
+    });
+  } catch (err) {
+    console.error('Create share link error:', err);
+    return res.status(500).json({ error: 'Could not create share link.' });
+  }
+});
+
+router.delete('/:id/share-link', requireAuth, async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) return invalidId(res);
+    const form = await Form.findById(req.params.id);
+    if (!form) {
+      return res.status(404).json({ error: 'Form not found.' });
+    }
+
+    await Form.updateOne({ _id: form._id }, { $unset: { responseShareToken: 1 } });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Revoke share link error:', err);
+    return res.status(500).json({ error: 'Could not revoke share link.' });
+  }
+});
+
 router.get('/:id/responses/export', requireAuth, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return invalidId(res);
@@ -386,7 +464,7 @@ router.get('/:id/responses/export', requireAuth, async (req, res) => {
     }
 
     const format = ensureFormat(form);
-    const responses = await FormResponse.find({ formId: form._id }).sort({ createdAt: -1 });
+    const responses = await FormResponse.find({ formId: form._id }).sort({ createdAt: 1 });
 
     const columnMap = new Map();
     for (const field of format.fields) {
@@ -433,6 +511,76 @@ router.get('/:id/responses/export', requireAuth, async (req, res) => {
   }
 });
 
+router.put('/:id/responses/:responseId', requireAuth, async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) return invalidId(res);
+    if (!isValidId(req.params.responseId)) {
+      return res.status(400).json({ error: 'Invalid response id.' });
+    }
+
+    const form = await Form.findById(req.params.id);
+    if (!form) {
+      return res.status(404).json({ error: 'Form not found.' });
+    }
+
+    const response = await FormResponse.findOne({ _id: req.params.responseId, formId: form._id });
+    if (!response) {
+      return res.status(404).json({ error: 'Response not found.' });
+    }
+
+    const snapFormat = response.format && typeof response.format === 'object' ? response.format : null;
+    const fields =
+      snapFormat && Array.isArray(snapFormat.fields) && snapFormat.fields.length
+        ? snapFormat.fields.map(serializeField)
+        : ensureFormat(form).fields;
+
+    const checked = validateAnswers(fields, req.body.answers);
+    if (checked.error) {
+      return res.status(400).json({ error: checked.error });
+    }
+
+    response.answers = checked.answers;
+    await response.save();
+
+    const responseCount = await FormResponse.countDocuments({ formId: form._id });
+    return res.json({
+      response: serializeResponse(response),
+      form: serializeForm({ ...form.toObject(), responseCount }, { includeMeta: true }),
+    });
+  } catch (err) {
+    console.error('Update form response error:', err);
+    return res.status(500).json({ error: 'Could not update response.' });
+  }
+});
+
+router.delete('/:id/responses/:responseId', requireAuth, async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) return invalidId(res);
+    if (!isValidId(req.params.responseId)) {
+      return res.status(400).json({ error: 'Invalid response id.' });
+    }
+
+    const form = await Form.findById(req.params.id);
+    if (!form) {
+      return res.status(404).json({ error: 'Form not found.' });
+    }
+
+    const response = await FormResponse.findOneAndDelete({ _id: req.params.responseId, formId: form._id });
+    if (!response) {
+      return res.status(404).json({ error: 'Response not found.' });
+    }
+
+    const responseCount = await FormResponse.countDocuments({ formId: form._id });
+    return res.json({
+      ok: true,
+      form: serializeForm({ ...form.toObject(), responseCount }, { includeMeta: true }),
+    });
+  } catch (err) {
+    console.error('Delete form response error:', err);
+    return res.status(500).json({ error: 'Could not delete response.' });
+  }
+});
+
 router.get('/:id/responses', requireAuth, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) return invalidId(res);
@@ -440,7 +588,7 @@ router.get('/:id/responses', requireAuth, async (req, res) => {
     if (!form) {
       return res.status(404).json({ error: 'Form not found.' });
     }
-    const responses = await FormResponse.find({ formId: form._id }).sort({ createdAt: -1 });
+    const responses = await FormResponse.find({ formId: form._id }).sort({ createdAt: 1 });
     return res.json({
       form: serializeForm(form, { includeMeta: true }),
       responses: responses.map(serializeResponse),
@@ -452,3 +600,4 @@ router.get('/:id/responses', requireAuth, async (req, res) => {
 });
 
 export default router;
+

@@ -186,6 +186,16 @@ async function backfillFormFormats() {
   }
 }
 
+async function cleanupNullShareTokens() {
+  const result = await Form.updateMany(
+    { responseShareToken: null },
+    { $unset: { responseShareToken: 1 } }
+  );
+  if (result.modifiedCount > 0) {
+    console.log(`Removed null responseShareToken from ${result.modifiedCount} form(s).`);
+  }
+}
+
 if (!process.env.JWT_SECRET) {
   console.warn('JWT_SECRET missing — using insecure development default.');
   process.env.JWT_SECRET = 'dev-calliphony-jwt-secret-change-me';
@@ -215,6 +225,7 @@ app.use(async (req, res, next) => {
       await seedAdmin();
       await migrateIntakeToForm();
       await backfillFormFormats();
+      await cleanupNullShareTokens();
       isInitialized = true;
     } catch (err) {
       console.error('Serverless initialization failed:', err);

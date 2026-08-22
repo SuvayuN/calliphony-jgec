@@ -79,6 +79,21 @@ export const api = {
     apiRequest(`/api/forms/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteForm: (id) => apiRequest(`/api/forms/${id}`, { method: 'DELETE' }),
   getFormResponses: (id) => apiRequest(`/api/forms/${id}/responses`),
+  updateFormResponse: (formId, responseId, answers) =>
+    apiRequest(`/api/forms/${formId}/responses/${responseId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ answers }),
+    }),
+  deleteFormResponse: (formId, responseId) =>
+    apiRequest(`/api/forms/${formId}/responses/${responseId}`, { method: 'DELETE' }),
+  getSharedFormResponses: (token) => apiRequest(`/api/forms/share/${token}/responses`),
+  enableFormShareLink: (id, { regenerate = false } = {}) =>
+    apiRequest(`/api/forms/${id}/share-link`, {
+      method: 'POST',
+      body: JSON.stringify({ regenerate }),
+    }),
+  revokeFormShareLink: (id) =>
+    apiRequest(`/api/forms/${id}/share-link`, { method: 'DELETE' }),
   exportFormResponses: async (id) => {
     const headers = {};
     const token = getToken();

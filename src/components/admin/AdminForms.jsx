@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { api } from '../../api/client';
+import FormResponsesTable, { buildResponseColumns, sortResponsesList } from '../FormResponsesTable';
+import ResponseEditModal from './ResponseEditModal';
 
 const FIELD_TYPES = [
   { value: 'text', label: 'Short text' },
@@ -40,29 +42,6 @@ function needsOptions(type) {
   return type === 'select' || type === 'radio' || type === 'checkbox';
 }
 
-function formatAnswer(value) {
-  if (Array.isArray(value)) return value.filter(Boolean).join(', ') || '—';
-  if (value == null || value === '') return '—';
-  return String(value);
-}
-
-function looksLikeUrl(value) {
-  return /^https?:\/\//i.test(String(value || '').trim());
-}
-
-function renderAnswer(value) {
-  const text = formatAnswer(value);
-  if (text === '—') return text;
-  if (looksLikeUrl(text)) {
-    return (
-      <a href={text} target="_blank" rel="noreferrer" style={{ color: 'var(--riso-red)', wordBreak: 'break-all' }}>
-        {text}
-      </a>
-    );
-  }
-  return text;
-}
-
 export default function AdminForms() {
   const [view, setView] = useState('list');
   const [forms, setForms] = useState([]);
@@ -75,6 +54,13 @@ export default function AdminForms() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [deleteConfirmId, setDeleteConfirmId] = useState('');
+  const [shareLink, setShareLink] = useState('');
+  const [shareBusy, setShareBusy] = useState(false);
+  const [sortKey, setSortKey] = useState('submitted');
+  const [sortDir, setSortDir] = useState('asc');
+  const [editingResponse, setEditingResponse] = useState(null);
+  const [responseSaving, setResponseSaving] = useState(false);
+  const [responseDeleteConfirmId, setResponseDeleteConfirmId] = useState('');
 
   const loadForms = async () => {
     const data = await api.getForms();
@@ -130,8 +116,18 @@ export default function AdminForms() {
     setSuccess('');
     try {
       const data = await api.getFormResponses(form.id);
-      setResponseForm(data.form || form);
+      const loadedForm = data.form || form;
+      setResponseForm(loadedForm);
       setResponses(data.responses || []);
+      setShareLink(
+        loadedForm.responseShareToken
+          ? `${window.location.origin}/responses/share/${loadedForm.responseShareToken}`
+          : ''
+      );
+      setSortKey('submitted');
+      setSortDir('asc');
+      setEditingResponse(null);
+      setResponseDeleteConfirmId('');
       setView('responses');
     } catch (err) {
       setError(err.message || 'Failed to load responses.');
@@ -250,6 +246,100 @@ export default function AdminForms() {
     }
   };
 
+  const handleEnableShareLink = async (form, { regenerate = false } = {}) => {
+    setError('');
+    setShareBusy(true);
+    try {
+      const data = await api.enableFormShareLink(form.id, { regenerate });
+      const url = `${window.location.origin}${data.path}`;
+      setShareLink(url);
+      setResponseForm((prev) =>
+        prev && prev.id === form.id ? { ...prev, responseShareToken: data.token, responseShareEnabled: true } : prev
+      );
+      await loadForms();
+      setSuccess(regenerate ? 'Share link regenerated.' : 'Live share link enabled.');
+    } catch (err) {
+      setError(err.message || 'Could not create share link.');
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const handleRevokeShareLink = async (form) => {
+    setError('');
+    setShareBusy(true);
+    try {
+      await api.revokeFormShareLink(form.id);
+      setShareLink('');
+      setResponseForm((prev) =>
+        prev && prev.id === form.id ? { ...prev, responseShareToken: null, responseShareEnabled: false } : prev
+      );
+      await loadForms();
+      setSuccess('Share link revoked.');
+    } catch (err) {
+      setError(err.message || 'Could not revoke share link.');
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const handleCopyShareLink = async () => {
+    if (!shareLink) return;
+    try {
+      await navigator.clipboard.writeText(shareLink);
+      setSuccess('Share link copied to clipboard.');
+    } catch {
+      setError('Could not copy link — select and copy it manually.');
+    }
+  };
+
+  const handleEditResponse = (row) => {
+    setError('');
+    setSuccess('');
+    setResponseDeleteConfirmId('');
+    setEditingResponse(row);
+  };
+
+  const handleSaveResponse = async (answers) => {
+    if (!responseForm || !editingResponse) return;
+    setError('');
+    setSuccess('');
+    setResponseSaving(true);
+    try {
+      const data = await api.updateFormResponse(responseForm.id, editingResponse.id, answers);
+      setResponses((prev) => prev.map((row) => (row.id === editingResponse.id ? data.response : row)));
+      if (data.form) setResponseForm(data.form);
+      setEditingResponse(null);
+      await loadForms();
+      setSuccess('Response updated.');
+    } catch (err) {
+      setError(err.message || 'Could not update response.');
+    } finally {
+      setResponseSaving(false);
+    }
+  };
+
+  const handleDeleteResponse = async (row) => {
+    if (responseDeleteConfirmId !== row.id) {
+      setResponseDeleteConfirmId(row.id);
+      return;
+    }
+    if (!responseForm) return;
+    setError('');
+    try {
+      const data = await api.deleteFormResponse(responseForm.id, row.id);
+      setResponses((prev) => prev.filter((r) => r.id !== row.id));
+      if (data.form) setResponseForm(data.form);
+      setResponseDeleteConfirmId('');
+      if (editingResponse?.id === row.id) setEditingResponse(null);
+      await loadForms();
+      setSuccess('Response deleted.');
+    } catch (err) {
+      setError(err.message || 'Could not delete response.');
+      setResponseDeleteConfirmId('');
+    }
+  };
+
   const handleDelete = async (form) => {
     if (deleteConfirmId !== form.id) {
       setDeleteConfirmId(form.id);
@@ -271,13 +361,32 @@ export default function AdminForms() {
     }
   };
 
-  const responseColumns = useMemo(() => {
-    const fields = responseForm?.format?.fields || responseForm?.fields || [];
-    if (fields.length) return fields;
-    const keys = new Set();
-    responses.forEach((row) => Object.keys(row.answers || {}).forEach((k) => keys.add(k)));
-    return [...keys].map((id) => ({ id, label: id }));
-  }, [responseForm, responses]);
+  useEffect(() => {
+    if (view !== 'responses' || !responseForm?.id || editingResponse) return undefined;
+    let cancelled = false;
+    const timer = setInterval(async () => {
+      try {
+        const data = await api.getFormResponses(responseForm.id);
+        if (!cancelled) setResponses(data.responses || []);
+      } catch {
+        /* keep last snapshot on poll failure */
+      }
+    }, 8000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [view, responseForm?.id, editingResponse]);
+
+  const responseColumns = useMemo(
+    () => buildResponseColumns(responseForm, responses),
+    [responseForm, responses]
+  );
+
+  const sortedResponses = useMemo(
+    () => sortResponsesList(responses, sortKey, sortDir),
+    [responses, sortKey, sortDir]
+  );
 
   if (loading) {
     return (
@@ -596,65 +705,106 @@ export default function AdminForms() {
             )}
           </div>
           <p style={{ color: 'var(--ink-muted)', marginBottom: '16px' }}>
-            {responses.length} response{responses.length === 1 ? '' : 's'} saved for {responseForm?.title}. These stay even if you change the questions later.
+            {responses.length} response{responses.length === 1 ? '' : 's'} saved for {responseForm?.title}. Sorting below is local only — the database order is unchanged.
           </p>
-          {responses.length === 0 ? (
-            <p style={{ color: 'var(--ink-muted)' }}>No responses yet.</p>
-          ) : (
-            <div className="glass-card" style={{ padding: 0, overflow: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: 'var(--font-body)' }}>
-                <thead>
-                  <tr style={{ borderBottom: '1.5px solid var(--border-ink-strong)', textAlign: 'left' }}>
-                    <th style={thStyle}>#</th>
-                    {responseColumns.map((col) => (
-                      <th key={col.id} style={thStyle}>
-                        {col.label}
-                      </th>
-                    ))}
-                    <th style={thStyle}>Submitted</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {responses.map((row, i) => (
-                    <tr key={row.id} style={{ borderBottom: '1px solid var(--border-ink)' }}>
-                      <td style={tdStyle}>{i + 1}</td>
-                      {responseColumns.map((col) => (
-                        <td key={col.id} style={{ ...tdStyle, maxWidth: '220px', wordBreak: 'break-word' }}>
-                          {renderAnswer(row.answers?.[col.id])}
-                        </td>
-                      ))}
-                      <td style={{ ...tdStyle, whiteSpace: 'nowrap', color: 'var(--ink-muted)', fontSize: '0.85rem' }}>
-                        {new Date(row.createdAt).toLocaleString('en-US', {
-                          month: 'short',
-                          day: 'numeric',
-                          year: 'numeric',
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+
+          {responses.length > 0 && (
+            <div className="form-responses-sort-bar glass-card">
+              <label htmlFor="response-sort-key">Sort by</label>
+              <select
+                id="response-sort-key"
+                className="form-input"
+                value={sortKey}
+                onChange={(e) => setSortKey(e.target.value)}
+              >
+                <option value="submitted">Submitted date</option>
+                {responseColumns.map((col) => (
+                  <option key={col.id} value={col.id}>
+                    {col.label}
+                  </option>
+                ))}
+              </select>
+              <label htmlFor="response-sort-dir">Order</label>
+              <select
+                id="response-sort-dir"
+                className="form-input"
+                value={sortDir}
+                onChange={(e) => setSortDir(e.target.value)}
+              >
+                <option value="asc">Ascending (A→Z / oldest first)</option>
+                <option value="desc">Descending (Z→A / newest first)</option>
+              </select>
             </div>
           )}
+
+          {responseForm && (
+            <div className="form-share-panel glass-card">
+              <div>
+                <strong style={{ fontFamily: 'var(--font-label)', fontSize: '0.78rem', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                  Live share link
+                </strong>
+                <p style={{ color: 'var(--ink-muted)', fontSize: '0.88rem', margin: '6px 0 0' }}>
+                  Anyone with this link can view responses in real time. They cannot edit or export.
+                </p>
+              </div>
+              {shareLink ? (
+                <div className="form-share-panel-actions">
+                  <input className="form-input" readOnly value={shareLink} aria-label="Share link URL" />
+                  <button type="button" className="btn-secondary btn-sm" onClick={handleCopyShareLink} disabled={shareBusy}>
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={() => handleEnableShareLink(responseForm, { regenerate: true })}
+                    disabled={shareBusy}
+                  >
+                    Regenerate
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={() => handleRevokeShareLink(responseForm)}
+                    disabled={shareBusy}
+                    style={{ color: 'var(--riso-red)', borderColor: 'var(--riso-red)' }}
+                  >
+                    Revoke
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="btn-primary btn-sm"
+                  onClick={() => handleEnableShareLink(responseForm)}
+                  disabled={shareBusy}
+                >
+                  Create share link
+                </button>
+              )}
+            </div>
+          )}
+
+          <FormResponsesTable
+            form={responseForm}
+            responses={sortedResponses}
+            adminMode
+            onEdit={handleEditResponse}
+            onDelete={handleDeleteResponse}
+            deleteConfirmId={responseDeleteConfirmId}
+          />
+
+          <ResponseEditModal
+            open={Boolean(editingResponse)}
+            response={editingResponse}
+            form={responseForm}
+            saving={responseSaving}
+            onClose={() => {
+              if (!responseSaving) setEditingResponse(null);
+            }}
+            onSave={handleSaveResponse}
+          />
         </>
       )}
     </div>
   );
 }
-
-const thStyle = {
-  padding: '14px 18px',
-  fontSize: '0.78rem',
-  fontFamily: 'var(--font-label)',
-  fontWeight: 700,
-  textTransform: 'uppercase',
-  letterSpacing: '0.08em',
-  color: 'var(--ink-muted)',
-};
-
-const tdStyle = {
-  padding: '14px 18px',
-  fontSize: '0.92rem',
-};

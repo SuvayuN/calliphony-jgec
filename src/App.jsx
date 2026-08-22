@@ -22,6 +22,7 @@ import AdminForms from './components/admin/AdminForms';
 import AdminSite from './components/admin/AdminSite';
 import ProtectedRoute from './components/admin/ProtectedRoute';
 import PublicForm from './components/PublicForm';
+import SharedFormResponses from './components/SharedFormResponses';
 
 function LandingPage({ events, secretaries }) {
   const [detailModalMode, setDetailModalMode] = useState(null);
@@ -198,6 +199,7 @@ export default function App() {
         <Route path="/admin" element={<AdminLogin />} />
         <Route path="/form" element={<PublicForm />} />
         <Route path="/form/:formId" element={<PublicForm />} />
+        <Route path="/responses/share/:token" element={<SharedFormResponses />} />
         <Route path="/intake" element={<Navigate to="/form" replace />} />
         <Route element={<ProtectedRoute />}>
           <Route element={<AdminLayout />}>
